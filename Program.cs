@@ -7,6 +7,7 @@ using Microsoft.IdentityModel.Tokens;
 using QwenSolvingApi.Data;
 using QwenSolvingApi.Models;
 using QwenSolvingApi.Services;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -66,6 +67,18 @@ builder.Services.AddRateLimiter(options =>
         opt.QueueLimit = 0;
     });
 });
+
+// Redis distributed cache (AbortOnConnectFail = false so the app starts
+// and falls back to the database when Redis is unreachable)
+var redisConnectionString = builder.Configuration.GetConnectionString("Redis")
+    ?? "localhost:6379";
+builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
+    ConnectionMultiplexer.Connect(new ConfigurationOptions
+    {
+        EndPoints = { redisConnectionString },
+        AbortOnConnectFail = false
+    }));
+builder.Services.AddSingleton<ICacheService, RedisCacheService>();
 
 // Register SlotPool as singleton (one pool for the entire application).
 // Slots are populated dynamically from the CaptchaUrls table (see startup block below);

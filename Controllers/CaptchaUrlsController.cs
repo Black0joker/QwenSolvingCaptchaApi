@@ -16,17 +16,23 @@ namespace QwenSolvingApi.Controllers;
 [Route("captcha-urls")]
 public class CaptchaUrlsController : ControllerBase
 {
+    private const string CacheKey = "captcha-urls:all";
+    private static readonly TimeSpan CacheExpiry = TimeSpan.FromMinutes(5);
+
     private readonly AppDbContext _db;
     private readonly SlotPool _slotPool;
+    private readonly ICacheService _cache;
     private readonly ILogger<CaptchaUrlsController> _logger;
 
     public CaptchaUrlsController(
         AppDbContext db,
         SlotPool slotPool,
+        ICacheService cache,
         ILogger<CaptchaUrlsController> logger)
     {
         _db = db;
         _slotPool = slotPool;
+        _cache = cache;
         _logger = logger;
     }
 
@@ -36,16 +42,20 @@ public class CaptchaUrlsController : ControllerBase
     [HttpGet]
     public async Task<ActionResult<List<CaptchaUrlResponse>>> GetAll(CancellationToken ct)
     {
-        var urls = await _db.CaptchaUrls
-            .AsNoTracking()
-            .OrderByDescending(u => u.CreatedAtUtc)
-            .Select(u => new CaptchaUrlResponse
-            {
-                Id = u.Id,
-                Url = u.Url,
-                CreatedAtUtc = u.CreatedAtUtc
-            })
-            .ToListAsync(ct);
+        var urls = await _cache.GetOrSetAsync(
+            CacheKey,
+            async token => await _db.CaptchaUrls
+                .AsNoTracking()
+                .OrderByDescending(u => u.CreatedAtUtc)
+                .Select(u => new CaptchaUrlResponse
+                {
+                    Id = u.Id,
+                    Url = u.Url,
+                    CreatedAtUtc = u.CreatedAtUtc
+                })
+                .ToListAsync(token),
+            CacheExpiry,
+            ct);
 
         return Ok(urls);
     }
@@ -79,6 +89,9 @@ public class CaptchaUrlsController : ControllerBase
 
         _db.CaptchaUrls.Add(entity);
         await _db.SaveChangesAsync(ct);
+
+        // Invalidate the cache so the next GetAll fetches fresh data
+        await _cache.RemoveAsync(CacheKey, ct);
 
         // Register the new URL with the slot pool immediately — the new slots
         // become available to waiting requests without restarting the API.
