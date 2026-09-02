@@ -12,8 +12,7 @@ using StackExchange.Redis;
 var builder = WebApplication.CreateBuilder(args);
 
 // Read configuration
-var upstreamUrl = builder.Configuration["UpstreamApi:BaseUrl"]
-    ?? "https://qwencaptchasolver-production-a965.up.railway.app";
+
 var maxConcurrency = builder.Configuration.GetValue<int>("UpstreamApi:MaxConcurrency", 3);
 var timeoutSeconds = builder.Configuration.GetValue<int>("UpstreamApi:TimeoutSeconds", 300);
 
@@ -92,7 +91,6 @@ builder.Services.AddScoped<CaptchaProxyService>();
 // Named HttpClient for upstream API calls
 builder.Services.AddHttpClient("upstream", client =>
 {
-    client.BaseAddress = new Uri(upstreamUrl);
     client.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
     client.DefaultRequestHeaders.Accept.Clear();
     client.DefaultRequestHeaders.Accept.Add(
@@ -146,24 +144,14 @@ using (var scope = app.Services.CreateScope())
             .Select(u => u.Url)
             .ToListAsync();
 
-        if (captchaUrls.Count == 0)
+        foreach (var captchaUrl in captchaUrls)
         {
-            slotPool.RegisterUrl(upstreamUrl);
-            app.Logger.LogWarning(
-                "CaptchaUrls table is empty. Registered fallback upstream URL '{Url}' ({Slots} slot(s)).",
-                upstreamUrl, maxConcurrency);
+            slotPool.RegisterUrl(captchaUrl);
         }
-        else
-        {
-            foreach (var captchaUrl in captchaUrls)
-            {
-                slotPool.RegisterUrl(captchaUrl);
-            }
 
-            app.Logger.LogInformation(
-                "Registered {UrlCount} captcha URL(s) from the database ({SlotCount} slot(s) total).",
-                captchaUrls.Count, slotPool.TotalSlotCount);
-        }
+        app.Logger.LogInformation(
+            "Registered {UrlCount} captcha URL(s) from the database ({SlotCount} slot(s) total).",
+            captchaUrls.Count, slotPool.TotalSlotCount);
     }
     catch (Exception ex)
     {
@@ -171,15 +159,6 @@ using (var scope = app.Services.CreateScope())
             ex,
             "Database migration/seeding failed. The API will start, but database-backed endpoints are unavailable.");
 
-        // Keep the proxy functional even without the database:
-        // fall back to the configured upstream URL if no slots were registered.
-        if (slotPool.AvailableCount == 0)
-        {
-            slotPool.RegisterUrl(upstreamUrl);
-            app.Logger.LogWarning(
-                "Registered fallback upstream URL '{Url}' ({Slots} slot(s)) because the database is unavailable.",
-                upstreamUrl, maxConcurrency);
-        }
     }
 }
 
