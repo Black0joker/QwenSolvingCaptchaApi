@@ -71,12 +71,28 @@ builder.Services.AddRateLimiter(options =>
 // and falls back to the database when Redis is unreachable)
 var redisConnectionString = builder.Configuration.GetConnectionString("Redis")
     ?? "localhost:6379";
+
+var redisOptions = new ConfigurationOptions
+{
+    AbortOnConnectFail = false
+};
+
+// Support redis:// URI format (e.g. redis://user:password@host:port)
+if (Uri.TryCreate(redisConnectionString, UriKind.Absolute, out var redisUri)
+    && (redisUri.Scheme == "redis" || redisUri.Scheme == "rediss"))
+{
+    redisOptions.EndPoints.Add(redisUri.Host, redisUri.Port);
+    redisOptions.Password = Uri.UnescapeDataString(redisUri.UserInfo.Split(':').Last());
+    redisOptions.User = Uri.UnescapeDataString(redisUri.UserInfo.Split(':').First());
+    redisOptions.Ssl = redisUri.Scheme == "rediss";
+}
+else
+{
+    redisOptions.EndPoints.Add(redisConnectionString);
+}
+
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
-    ConnectionMultiplexer.Connect(new ConfigurationOptions
-    {
-        EndPoints = { redisConnectionString },
-        AbortOnConnectFail = false
-    }));
+    ConnectionMultiplexer.Connect(redisOptions));
 builder.Services.AddSingleton<ICacheService, RedisCacheService>();
 
 // Register SlotPool as singleton (one pool for the entire application).

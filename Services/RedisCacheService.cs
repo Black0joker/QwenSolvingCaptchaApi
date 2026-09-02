@@ -24,6 +24,7 @@ public sealed class RedisCacheService : ICacheService
 {
     private readonly IConnectionMultiplexer _redis;
     private readonly ILogger<RedisCacheService> _logger;
+    private volatile bool _wasConnected;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -39,17 +40,26 @@ public sealed class RedisCacheService : ICacheService
 
     /// <summary>
     /// Returns true if the Redis connection is currently usable.
+    /// Logs a warning only on state transitions (connected → disconnected, disconnected → connected)
+    /// to avoid spamming the log on every call.
     /// </summary>
     private bool IsAvailable
     {
         get
         {
-            if (!_redis.IsConnected)
+            var connected = _redis.IsConnected;
+
+            if (!connected && _wasConnected)
             {
-                _logger.LogWarning("Redis is not connected. Falling back to database.");
-                return false;
+                _logger.LogWarning("Redis connection lost. Falling back to database.");
             }
-            return true;
+            else if (connected && !_wasConnected)
+            {
+                _logger.LogInformation("Redis connection restored.");
+            }
+
+            _wasConnected = connected;
+            return connected;
         }
     }
 
