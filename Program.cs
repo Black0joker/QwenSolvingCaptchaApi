@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using QwenSolvingApi.Data;
@@ -47,6 +48,24 @@ builder.Services
         };
     });
 builder.Services.AddAuthorization();
+
+// Fixed-window rate limiting: 5 requests per hour per IP
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, ct) =>
+    {
+        context.HttpContext.Response.ContentType = "application/json";
+        await context.HttpContext.Response.WriteAsJsonAsync(
+            new { error = "Too many requests. Please try again later." }, ct);
+    };
+    options.AddFixedWindowLimiter("auth", opt =>
+    {
+        opt.PermitLimit = 5;
+        opt.Window = TimeSpan.FromHours(1);
+        opt.QueueLimit = 0;
+    });
+});
 
 // Register SlotPool as singleton (one pool for the entire application).
 // Slots are populated dynamically from the CaptchaUrls table (see startup block below);
@@ -159,6 +178,7 @@ if (app.Environment.IsDevelopment())
 
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 app.MapControllers();
 

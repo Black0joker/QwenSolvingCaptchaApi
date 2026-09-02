@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using QwenSolvingApi.Data;
 using QwenSolvingApi.Models;
@@ -32,6 +33,7 @@ public class AuthController : ControllerBase
     /// Authenticates an admin user and returns a signed JWT.
     /// </summary>
     [HttpPost("login")]
+    [EnableRateLimiting("auth")]
     public async Task<ActionResult<LoginResponse>> Login(
         [FromBody] LoginRequest request,
         CancellationToken ct)
