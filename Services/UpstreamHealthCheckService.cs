@@ -1,4 +1,6 @@
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using QwenSolvingApi.Data;
 using QwenSolvingApi.Models;
 
 namespace QwenSolvingApi.Services;
@@ -6,8 +8,8 @@ namespace QwenSolvingApi.Services;
 /// <summary>
 /// Background service that periodically tests the upstream API health.
 /// Sends GET /health and validates the response is {"status":"ok"}.
-/// Retries up to 3 times. If all attempts fail, it dequeues all slots
-/// from the pool and re-enqueues them to reset any stuck state.
+/// Retries up to 3 times. If all attempts fail for a URL, it removes
+/// that URL from the database and resets the slot pool.
 /// </summary>
 public sealed class UpstreamHealthCheckService : BackgroundService
 {
@@ -15,30 +17,35 @@ public sealed class UpstreamHealthCheckService : BackgroundService
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<UpstreamHealthCheckService> _logger;
     private readonly IConfiguration _configuration;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ICacheService _cache;
 
     private const int MaxRetries = 3;
+    private const string CacheKey = "captcha-urls:all";
 
     public UpstreamHealthCheckService(
         SlotPool slotPool,
         IHttpClientFactory httpClientFactory,
         ILogger<UpstreamHealthCheckService> logger,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        IServiceScopeFactory scopeFactory,
+        ICacheService cache)
     {
         _slotPool = slotPool;
         _httpClientFactory = httpClientFactory;
         _logger = logger;
         _configuration = configuration;
+        _scopeFactory = scopeFactory;
+        _cache = cache;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var checkIntervalSeconds = _configuration.GetValue<int>("UpstreamApi:HealthCheckIntervalSeconds", 30);
-        var upstreamUrl = _configuration["UpstreamApi:BaseUrl"]
-            ?? "https://qwencaptchasolver-production-a965.up.railway.app";
 
         _logger.LogInformation(
-            "Upstream health check service started. Interval: {Interval}s, Target: {Url}/health",
-            checkIntervalSeconds, upstreamUrl);
+            "Upstream health check service started. Interval: {Interval}s",
+            checkIntervalSeconds);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -46,19 +53,58 @@ public sealed class UpstreamHealthCheckService : BackgroundService
             {
                 await Task.Delay(TimeSpan.FromSeconds(checkIntervalSeconds), stoppingToken);
 
-                var isHealthy = await TestUpstreamHealthAsync(upstreamUrl, stoppingToken);
+                // Fetch captcha URLs from cache; falls back to database on cache miss
+                var captchaUrls = await _cache.GetOrSetAsync(
+                    CacheKey,
+                    async token =>
+                    {
+                        using var scope = _scopeFactory.CreateScope();
+                        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                        return await db.CaptchaUrls
+                            .AsNoTracking()
+                            .OrderByDescending(u => u.CreatedAtUtc)
+                            .Select(u => new CaptchaUrlResponse
+                            {
+                                Id = u.Id,
+                                Url = u.Url,
+                                CreatedAtUtc = u.CreatedAtUtc
+                            })
+                            .ToListAsync(token);
+                    },
+                    TimeSpan.FromMinutes(5),
+                    stoppingToken);
 
-                if (!isHealthy)
+                if (captchaUrls.Count == 0)
                 {
-                    _logger.LogWarning(
-                        "Upstream API failed health check after {Retries} attempts. Dequeuing slots to reset pool.",
-                        MaxRetries);
-
-                    await DequeueAndResetSlotsAsync(stoppingToken);
+                    _logger.LogDebug("No captcha URLs registered. Skipping health check.");
+                    continue;
                 }
-                else
+
+                var unhealthyIds = new List<int>();
+
+                foreach (var entry in captchaUrls)
                 {
-                    _logger.LogInformation("Upstream API health check passed: {\"status\":\"ok\"}");
+                    var isHealthy = await TestUpstreamHealthAsync(entry.Url, stoppingToken);
+
+                    if (!isHealthy)
+                    {
+                        _logger.LogWarning(
+                            "Captcha URL {Url} (Id={Id}) failed health check after {Retries} attempts. Marking for removal.",
+                            entry.Url, entry.Id, MaxRetries);
+                        unhealthyIds.Add(entry.Id);
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "Captcha URL {Url} (Id={Id}) health check passed.",
+                            entry.Url, entry.Id);
+                    }
+                }
+
+                if (unhealthyIds.Count > 0)
+                {
+                    await RemoveUnhealthyUrlsAsync(unhealthyIds, stoppingToken);
+                    await DequeueAndResetSlotsAsync(stoppingToken);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -150,6 +196,26 @@ public sealed class UpstreamHealthCheckService : BackgroundService
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Removes unhealthy captcha URLs from the database and invalidates the cache.
+    /// </summary>
+    private async Task RemoveUnhealthyUrlsAsync(List<int> unhealthyIds, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var removed = await db.CaptchaUrls
+            .Where(u => unhealthyIds.Contains(u.Id))
+            .ExecuteDeleteAsync(ct);
+
+        _logger.LogInformation(
+            "Removed {Count} unhealthy captcha URL(s) from the database.",
+            removed);
+
+        // Invalidate the cached URL list so the next GetAll fetches fresh data
+        await _cache.RemoveAsync(CacheKey, ct);
     }
 
     /// <summary>
